@@ -45,7 +45,7 @@ class CatalogInsights:
         feedback = self.connection.execute(
             "SELECT COUNT(*) AS amount,AVG(rating) AS average_rating,"
             "SUM(CASE WHEN consent_to_follow_up=1 THEN 1 ELSE 0 END) AS follow_up "
-            "FROM public_feedback WHERE product_id=?",
+            "FROM public_feedback WHERE product_id=? AND disposition_status='active'",
             (product["id"],),
         ).fetchone()
         rule = RULES[str(product["risk_level"])]
@@ -94,7 +94,7 @@ class CatalogInsights:
         audience_counter: Counter[str] = Counter()
         ratings: Counter[int] = Counter()
         for row in self.connection.execute(
-            "SELECT audience_type,rating,tags_json FROM public_feedback WHERE product_id=? ORDER BY id",
+            "SELECT audience_type,rating,tags_json FROM public_feedback WHERE product_id=? AND disposition_status='active' ORDER BY id",
             (product["id"],),
         ).fetchall():
             audience_counter[str(row["audience_type"])] += 1

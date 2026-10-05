@@ -59,6 +59,10 @@ class EvidenceReview(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class PartnerExportRequest(BaseModel):
+    partner_code: str = Field(min_length=2, max_length=64)
+
+
 class FeedbackSubmit(BaseModel):
     product_code: str = Field(min_length=2, max_length=64)
     site_code: str = Field(min_length=2, max_length=64)
@@ -69,6 +73,7 @@ class FeedbackSubmit(BaseModel):
     comment: str = Field(default="", max_length=2000)
     contact_digest: str = Field(default="", max_length=128)
     consent_to_follow_up: bool = False
+    subject_digest: str | None = Field(default=None, min_length=8, max_length=128)
 
     @model_validator(mode="after")
     def require_contact_for_follow_up(self) -> "FeedbackSubmit":

@@ -30,6 +30,7 @@ class SessionSubmit(BaseModel):
     parameters: dict[str, Any]
     priority: int = Field(default=50, ge=0, le=100)
     idempotency_key: str = Field(min_length=6, max_length=160)
+    subject_digest: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class SessionClaim(BaseModel):

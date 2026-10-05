@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from app.catalog.repository import CatalogRepository
@@ -87,6 +88,8 @@ class CatalogService:
         return self.repository.list_evidence(product_id=product_id, status=status)
 
     def submit_feedback(self, data: dict) -> dict:
+        from app.consent.service import ConsentService
+
         product = self.repository.product_by_code(data["product_code"])
         if product is None or not product["active"]:
             raise NotFoundError("可体验的健康创新产品不存在")
@@ -97,7 +100,45 @@ class CatalogService:
         if duplicate:
             return duplicate
         with transaction(immediate=True) as connection:
-            return CatalogRepository(connection).create_feedback(product["id"], site["id"], data, to_storage(self.clock.now()))
+            catalog = CatalogRepository(connection)
+            consent = ConsentService(connection, self.clock)
+            now = to_storage(self.clock.now())
+            grant_id = None
+            subject_digest = (data.get("subject_digest") or "").strip()
+            if subject_digest:
+                improvement = consent.effective_decision(
+                    subject_digest=subject_digest, purpose="internal_improvement",
+                    product_id=product["id"], connection=connection,
+                )
+                if not improvement["permitted"]:
+                    raise ConflictError(
+                        "参与者未授权将体验反馈用于内部产品改进",
+                        context={"reason": improvement["reason"]},
+                    )
+                grant_id = improvement["grant_id"]
+                if data["consent_to_follow_up"]:
+                    follow_up = consent.effective_decision(
+                        subject_digest=subject_digest, purpose="follow_up_contact",
+                        product_id=product["id"], connection=connection,
+                    )
+                    if not follow_up["permitted"]:
+                        raise ConflictError(
+                            "参与者未授权后续联系", context={"reason": follow_up["reason"]}
+                        )
+            feedback = catalog.create_feedback(product["id"], site["id"], data, now, consent_grant_id=grant_id)
+            if grant_id:
+                consent.register_activity(
+                    grant_id=grant_id, purpose="internal_improvement", resource_type="feedback",
+                    resource_id=str(feedback["id"]), product_id=product["id"], site_id=site["id"],
+                    session_reference=data["session_reference"], status="completed", connection=connection, now=now,
+                )
+                if data["consent_to_follow_up"]:
+                    consent.register_activity(
+                        grant_id=grant_id, purpose="follow_up_contact", resource_type="feedback",
+                        resource_id=str(feedback["id"]), product_id=product["id"], site_id=site["id"],
+                        session_reference=data["session_reference"], status="in_progress", connection=connection, now=now,
+                    )
+            return feedback
 
     def feedback_summary(self, product_code: str | None) -> list[dict]:
         product_id = None
@@ -107,4 +148,44 @@ class CatalogService:
                 raise NotFoundError("健康创新产品不存在")
             product_id = product["id"]
         return self.repository.feedback_summary(product_id)
+
+    def export_for_partner(self, product_code: str, partner_code: str) -> dict:
+        from app.consent.service import ConsentService
+
+        product = self.repository.product_by_code(product_code)
+        if product is None or not product["active"]:
+            raise NotFoundError("健康创新产品不存在")
+        partner_code = partner_code.strip()
+        with transaction(immediate=True) as connection:
+            catalog = CatalogRepository(connection)
+            consent = ConsentService(connection, self.clock)
+            now = to_storage(self.clock.now())
+            exported: list[dict] = []
+            notice_basis: set[str] = set()
+            rows = connection.execute(
+                "SELECT f.id,f.audience_type,f.rating,f.tags_json,f.consent_grant_id,g.subject_digest "
+                "FROM public_feedback f JOIN consent_grants g ON g.id=f.consent_grant_id "
+                "WHERE f.product_id=? AND f.disposition_status='active' ORDER BY f.id",
+                (product["id"],),
+            ).fetchall()
+            for row in rows:
+                decision = consent.effective_decision(
+                    subject_digest=row["subject_digest"], purpose="partner_sharing",
+                    product_id=product["id"], partner_code=partner_code, connection=connection,
+                )
+                if not decision["permitted"]:
+                    continue
+                notice_basis.add(decision["notice_version_code"])
+                consent.register_activity(
+                    grant_id=decision["grant_id"], purpose="partner_sharing", resource_type="feedback",
+                    resource_id=str(row["id"]), product_id=product["id"], site_id=None,
+                    session_reference="", status="completed", connection=connection, now=now,
+                )
+                exported.append({
+                    "feedback_id": row["id"], "audience_type": row["audience_type"],
+                    "rating": row["rating"], "tags": json.loads(row["tags_json"]),
+                })
+            return {"product_code": product_code, "partner_code": partner_code,
+                    "notice_basis": sorted(notice_basis),
+                    "items": exported, "exported_at": now}
 

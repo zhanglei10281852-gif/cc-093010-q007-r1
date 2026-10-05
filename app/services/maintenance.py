@@ -47,6 +47,13 @@ class MaintenanceService:
         "pilot_sessions",
         "pilot_observations",
         "pilot_interventions",
+        "consent_notice_versions",
+        "consent_grants",
+        "consent_purpose_decisions",
+        "consent_events",
+        "consent_processing_activities",
+        "consent_disposition_tasks",
+        "consent_retention_rules",
     )
 
     def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None) -> None:

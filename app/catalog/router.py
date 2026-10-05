@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.catalog.schemas import EvidenceReview, EvidenceSubmit, FeedbackSubmit, ProductCreate, ProductUpdate, SiteCreate, SiteUpdate
+from app.catalog.schemas import EvidenceReview, EvidenceSubmit, FeedbackSubmit, PartnerExportRequest, ProductCreate, ProductUpdate, SiteCreate, SiteUpdate
 from app.catalog.insights import CatalogInsights
 from app.catalog.service import CatalogService
 from app.database import get_connection
@@ -68,6 +68,11 @@ def submit_feedback(payload: FeedbackSubmit):
 @router.get("/feedback/summary")
 def feedback_summary(product_code: str | None = None):
     return {"items": service().feedback_summary(product_code)}
+
+
+@router.post("/feedback/partner-export/{product_code}")
+def partner_export(product_code: str, payload: PartnerExportRequest):
+    return service().export_for_partner(product_code, payload.partner_code)
 
 
 @router.get("/insights/products/{product_code}/readiness")

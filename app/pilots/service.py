@@ -48,6 +48,8 @@ class PilotOperationsService:
             return PilotRepository(connection).upsert_quota(actor=actor, now=now, **payload)
 
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from app.consent.service import ConsentService
+
         now_value = self.clock.now()
         now = to_storage(now_value)
         with transaction(immediate=True) as connection:
@@ -63,12 +65,28 @@ class PilotOperationsService:
                     raise ConflictError("同一幂等键对应了不同的试点参数")
                 return dict(repository.session_by_id(existing["id"]))
             self._check_quota(repository, payload["requested_by"], now_value)
-            return repository.create_session(
+            consent = ConsentService(connection, self.clock)
+            grant_id = None
+            subject_digest = (payload.get("subject_digest") or "").strip()
+            if subject_digest:
+                decision = consent.effective_decision(subject_digest=subject_digest, purpose="collect", connection=connection)
+                if not decision["permitted"]:
+                    raise ConflictError("参与者未授权采集，不能提交体验场次", context={"reason": decision["reason"]})
+                grant_id = decision["grant_id"]
+            session = repository.create_session(
                 protocol_id=protocol["id"], project_code=payload["project_code"],
                 requested_by=payload["requested_by"], parameters=parameters,
                 parameter_digest=parameter_digest, priority=payload["priority"],
                 idempotency_key=payload["idempotency_key"], max_attempts=protocol["max_attempts"], now=now,
+                consent_grant_id=grant_id, subject_digest=subject_digest,
             )
+            if grant_id:
+                consent.register_activity(
+                    grant_id=grant_id, purpose="collect", resource_type="session",
+                    resource_id=str(session["id"]), product_id=None, site_id=None,
+                    session_reference=payload["project_code"], status="in_progress", connection=connection, now=now,
+                )
+            return session
 
     def list_sessions(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_sessions(status=status, project_code=project_code, requested_by=requested_by, limit=max(1, min(limit, 500)))
@@ -113,6 +131,8 @@ class PilotOperationsService:
             return dict(PilotRepository(connection).session_by_id(session_id))
 
     def complete(self, session_id: int, site_code: str, observation: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+        from app.consent.service import ConsentService
+
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
@@ -121,6 +141,16 @@ class PilotOperationsService:
                 raise NotFoundError("试点体验场次不存在")
             if session["status"] != "running" or session["lease_owner"] != site_code:
                 raise ConflictError("体验场次未由当前执行站点持有")
+            consent = ConsentService(connection, self.clock)
+            if session["consent_grant_id"] and session["subject_digest"]:
+                report_decision = consent.effective_decision(
+                    subject_digest=session["subject_digest"], purpose="instant_report", connection=connection,
+                )
+                if not report_decision["permitted"]:
+                    raise ConflictError(
+                        "参与者未授权生成即时结论，不能提交观察报告",
+                        context={"reason": report_decision["reason"]},
+                    )
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM pilot_observations WHERE session_id=?", (session_id,)).fetchone()[0])
             connection.execute(
                 "INSERT INTO pilot_observations(session_id,version,observation_json,metrics_json,observation_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -130,6 +160,13 @@ class PilotOperationsService:
                 "UPDATE pilot_sessions SET status='succeeded',current_observation_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (version, now, now, session_id),
             )
+            if session["consent_grant_id"]:
+                consent.register_activity(
+                    grant_id=int(session["consent_grant_id"]), purpose="instant_report",
+                    resource_type="observation_report", resource_id=str(session_id),
+                    product_id=None, site_id=None, session_reference=session["project_code"],
+                    status="completed", connection=connection, now=now,
+                )
             return dict(repository.session_by_id(session_id))
 
     def fail(self, session_id: int, site_code: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:

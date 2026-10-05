@@ -142,10 +142,10 @@ class CatalogRepository:
             (site_id, session_reference, audience_type, contact_digest),
         ).fetchone())
 
-    def create_feedback(self, product_id: int, site_id: int, data: dict, now: str) -> dict:
+    def create_feedback(self, product_id: int, site_id: int, data: dict, now: str, consent_grant_id: int | None = None) -> dict:
         cursor = self.connection.execute(
-            "INSERT INTO public_feedback(product_id,site_id,session_reference,audience_type,rating,tags_json,comment,contact_digest,consent_to_follow_up,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (product_id, site_id, data["session_reference"], data["audience_type"], data["rating"], json.dumps(sorted(set(data["tags"])), ensure_ascii=False), data["comment"], data["contact_digest"], 1 if data["consent_to_follow_up"] else 0, now),
+            "INSERT INTO public_feedback(product_id,site_id,session_reference,audience_type,rating,tags_json,comment,contact_digest,consent_to_follow_up,consent_grant_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (product_id, site_id, data["session_reference"], data["audience_type"], data["rating"], json.dumps(sorted(set(data["tags"])), ensure_ascii=False), data["comment"], data["contact_digest"], 1 if data["consent_to_follow_up"] else 0, consent_grant_id, now),
         )
         return dict(self.connection.execute("SELECT * FROM public_feedback WHERE id=?", (cursor.lastrowid,)).fetchone())
 
@@ -155,7 +155,7 @@ class CatalogRepository:
         rows = self.connection.execute(
             "SELECT p.id AS product_id,p.code AS product_code,p.name AS product_name,COUNT(f.id) AS feedback_count,"
             "ROUND(AVG(f.rating),2) AS average_rating,SUM(CASE WHEN f.consent_to_follow_up=1 THEN 1 ELSE 0 END) AS follow_up_count "
-            "FROM health_products p LEFT JOIN public_feedback f ON f.product_id=p.id" + where + " GROUP BY p.id ORDER BY feedback_count DESC,p.code",
+            "FROM health_products p LEFT JOIN public_feedback f ON f.product_id=p.id AND f.disposition_status='active'" + where + " GROUP BY p.id ORDER BY feedback_count DESC,p.code",
             params,
         ).fetchall()
         return [dict(row) for row in rows]

@@ -186,6 +186,9 @@ CREATE TABLE IF NOT EXISTS public_feedback (
     comment TEXT NOT NULL DEFAULT '',
     contact_digest TEXT NOT NULL DEFAULT '',
     consent_to_follow_up INTEGER NOT NULL DEFAULT 0 CHECK(consent_to_follow_up IN (0,1)),
+    consent_grant_id INTEGER REFERENCES consent_grants(id),
+    disposition_status TEXT NOT NULL DEFAULT 'active' CHECK(disposition_status IN ('active','retained','quarantined','deleted')),
+    disposition_at TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(site_id, session_reference, audience_type, contact_digest)
 );
@@ -238,6 +241,8 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
+    consent_grant_id INTEGER REFERENCES consent_grants(id),
+    subject_digest TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(requested_by, idempotency_key)
@@ -266,7 +271,125 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+CREATE TABLE IF NOT EXISTS consent_notice_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_code TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    body_digest TEXT NOT NULL,
+    purposes_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'published' CHECK(status IN ('draft','published','retired')),
+    published_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS consent_grants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_key TEXT NOT NULL UNIQUE,
+    subject_ref TEXT NOT NULL,
+    subject_digest TEXT NOT NULL,
+    signer_type TEXT NOT NULL CHECK(signer_type IN ('self','guardian')),
+    guardian_relation TEXT NOT NULL DEFAULT '',
+    guardian_basis TEXT NOT NULL DEFAULT '',
+    signer_display TEXT NOT NULL DEFAULT '',
+    product_id INTEGER REFERENCES health_products(id),
+    site_id INTEGER REFERENCES pilot_sites(id),
+    session_reference TEXT NOT NULL DEFAULT '',
+    notice_id INTEGER NOT NULL REFERENCES consent_notice_versions(id),
+    notice_version_code TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_until TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','withdrawn','expired','superseded')),
+    latest_event_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grants_subject ON consent_grants(subject_ref,id);
+CREATE INDEX IF NOT EXISTS idx_grants_scope ON consent_grants(product_id,site_id,session_reference);
+CREATE INDEX IF NOT EXISTS idx_grants_validity ON consent_grants(valid_until,status);
+CREATE TABLE IF NOT EXISTS consent_purpose_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_id INTEGER NOT NULL REFERENCES consent_grants(id) ON DELETE CASCADE,
+    purpose_code TEXT NOT NULL CHECK(purpose_code IN ('collect','instant_report','internal_improvement','partner_sharing','follow_up_contact')),
+    decision TEXT NOT NULL CHECK(decision IN ('granted','denied')),
+    partner_code TEXT NOT NULL DEFAULT '',
+    partner_scope_digest TEXT NOT NULL DEFAULT '',
+    valid_until TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(grant_id,purpose_code,partner_code)
+);
+CREATE TABLE IF NOT EXISTS consent_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_id INTEGER NOT NULL REFERENCES consent_grants(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL CHECK(event_type IN ('granted','denied','withdrawn','expired','superseded')),
+    purpose_codes_json TEXT NOT NULL,
+    decisions_json TEXT NOT NULL,
+    notice_version_code TEXT NOT NULL,
+    actor_name TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    correlation_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consent_events_grant ON consent_events(grant_id,id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_consent_events_idempotency ON consent_events(idempotency_key) WHERE idempotency_key<>'';
+CREATE TABLE IF NOT EXISTS consent_processing_activities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_id INTEGER REFERENCES consent_grants(id),
+    purpose_code TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    product_id INTEGER REFERENCES health_products(id),
+    site_id INTEGER REFERENCES pilot_sites(id),
+    session_reference TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','in_progress','completed','stopped')),
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activities_pending ON consent_processing_activities(status,purpose_code);
+CREATE INDEX IF NOT EXISTS idx_activities_resource ON consent_processing_activities(resource_type,resource_id);
+CREATE TABLE IF NOT EXISTS consent_disposition_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_id INTEGER REFERENCES consent_grants(id),
+    trigger_event_id INTEGER REFERENCES consent_events(id),
+    purpose_code TEXT NOT NULL,
+    source_resource_type TEXT NOT NULL,
+    source_resource_id TEXT NOT NULL,
+    obligation_code TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL CHECK(action IN ('retain','quarantine','delete')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','in_progress','completed','cancelled')),
+    retain_until TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(grant_id,purpose_code,source_resource_type,source_resource_id,action)
+);
+CREATE INDEX IF NOT EXISTS idx_disposition_status ON consent_disposition_tasks(status,id);
+CREATE TABLE IF NOT EXISTS consent_retention_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    purpose_code TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('retain','quarantine','delete')),
+    obligation_code TEXT NOT NULL DEFAULT '',
+    retain_days INTEGER NOT NULL DEFAULT 0 CHECK(retain_days >= 0),
+    updated_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(purpose_code,resource_type)
+);
 '''
+
+
+DEFAULT_RETENTION_RULES = [
+    ("collect", "session", "retain", "event_integrity", 90),
+    ("instant_report", "observation_report", "retain", "safety_traceability", 180),
+    ("internal_improvement", "feedback", "quarantine", "", 0),
+    ("partner_sharing", "feedback", "delete", "", 0),
+    ("partner_sharing", "observation_report", "delete", "", 0),
+    ("follow_up_contact", "feedback", "quarantine", "contact_suppression", 30),
+]
 
 
 PERMISSIONS = [
@@ -280,6 +403,9 @@ PERMISSIONS = [
     ("catalog.write", "维护健康创新目录", "catalog", "write"),
     ("evidence.review", "审阅产品证据", "evidence", "review"),
     ("feedback.read", "查看体验反馈", "feedback", "read"),
+    ("consent.manage", "维护用途授权与告知版本", "consent", "manage"),
+    ("consent.read", "查看用途授权详情", "consent", "read"),
+    ("consent.dispose", "执行撤回后的数据处置", "consent", "dispose"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
 ]
@@ -334,7 +460,8 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _migrate_columns(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -356,6 +483,33 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+        for purpose_code, resource_type, action, obligation_code, retain_days in DEFAULT_RETENTION_RULES:
+            connection.execute(
+                "INSERT OR IGNORE INTO consent_retention_rules(purpose_code,resource_type,action,obligation_code,retain_days,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,'system',?,?)",
+                (purpose_code, resource_type, action, obligation_code, retain_days, now, now),
+            )
+
+
+def _migrate_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"]) for row in connection.execute("PRAGMA table_info(public_feedback)").fetchall()
+    }
+    if "consent_grant_id" not in columns:
+        connection.execute("ALTER TABLE public_feedback ADD COLUMN consent_grant_id INTEGER REFERENCES consent_grants(id)")
+    if "disposition_status" not in columns:
+        connection.execute(
+            "ALTER TABLE public_feedback ADD COLUMN disposition_status TEXT NOT NULL DEFAULT 'active' "
+            "CHECK(disposition_status IN ('active','retained','quarantined','deleted'))"
+        )
+    if "disposition_at" not in columns:
+        connection.execute("ALTER TABLE public_feedback ADD COLUMN disposition_at TEXT")
+    session_columns = {
+        str(row["name"]) for row in connection.execute("PRAGMA table_info(pilot_sessions)").fetchall()
+    }
+    if "consent_grant_id" not in session_columns:
+        connection.execute("ALTER TABLE pilot_sessions ADD COLUMN consent_grant_id INTEGER REFERENCES consent_grants(id)")
+    if "subject_digest" not in session_columns:
+        connection.execute("ALTER TABLE pilot_sessions ADD COLUMN subject_digest TEXT NOT NULL DEFAULT ''")
 
 
 def migrate_db() -> None:

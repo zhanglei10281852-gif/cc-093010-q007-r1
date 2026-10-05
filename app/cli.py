@@ -107,12 +107,91 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check-db", help="检查数据库完整性")
     sub.add_parser("smoke", help="进程内检查根路径和健康接口")
     sub.add_parser("pilot-demo", help="运行产品、场地、方案和场次演示")
+    sub.add_parser("consent-demo", help="运行分用途授权、闸门、撤回和派生处置演示")
     return parser
+
+
+def consent_demo() -> int:
+    with tempfile.TemporaryDirectory(prefix="health-consent-") as directory:
+        os.environ["HEALTH_INNOVATION_DATABASE_PATH"] = os.path.join(directory, "consent.db")
+        close_connection()
+        with TestClient(app) as client:
+            bootstrap = client.post("/api/auth/bootstrap", json={"username": "admin", "password": "Admin!23456", "client_label": "consent-demo"})
+            if bootstrap.status_code != 201:
+                _print({"bootstrap": bootstrap.text})
+                return 1
+            login = client.post("/api/auth/login", json={"username": "admin", "password": "Admin!23456", "client_label": "consent-demo"})
+            headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+            client.post("/api/catalog/sites", json={
+                "code": "dte-hall-a", "name": "数贸会 AI 体验点", "site_type": "展会体验点",
+                "region": "杭州", "capabilities": ["tongue-ai", "eeg"],
+            })
+            partner = client.post("/api/consent/partners", headers=headers, json={
+                "partner_code": "univ-lab", "name": "联合大学神经工程实验室",
+                "partner_type": "研究机构", "region": "浙江", "retention_days": 1825,
+            })
+            notice = client.post("/api/consent/notices", headers=headers, json={
+                "notice_code": "tongue-eeg", "title": "AI 舌诊与脑电体验个人信息处理告知",
+                "content_hash": "tongue-eeg-v1-2026-09-01",
+                "purposes": ["collection", "instant_report", "product_improvement", "partner_sharing", "follow_up"],
+                "data_categories": ["舌象图像", "脑电信号", "体验反馈"],
+                "partners": ["univ-lab"], "created_by": "privacy-officer",
+            })
+            decisions = [
+                {"purpose_code": "collection", "decision": "allow"},
+                {"purpose_code": "instant_report", "decision": "allow"},
+                {"purpose_code": "product_improvement", "decision": "allow"},
+                {"purpose_code": "partner_sharing", "partner_code": "univ-lab", "decision": "deny"},
+                {"purpose_code": "follow_up", "decision": "deny"},
+            ]
+            consent = client.post("/api/consent/records", json={
+                "participant_digest": "visitor-demo-0001", "site_code": "dte-hall-a",
+                "session_reference": "dte-2026-0001", "subject_type": "self",
+                "notice_code": "tongue-eeg", "decisions": decisions,
+                "validity_days": 180, "idempotency_key": "consent-demo-000001",
+            })
+            report_gate = client.get("/api/consent/check?participant_digest=visitor-demo-0001&purpose_code=instant_report")
+            share_gate = client.get(
+                "/api/consent/check?participant_digest=visitor-demo-0001&purpose_code=partner_sharing&partner_code=univ-lab"
+            )
+            register = client.post("/api/consent/processing/intents", json={
+                "participant_digest": "visitor-demo-0001", "purpose_code": "instant_report",
+                "site_code": "dte-hall-a", "session_reference": "dte-2026-0001",
+                "record_type": "instant_report", "idempotency_key": "intent-demo-000001",
+            })
+            client.post("/api/consent/processing/intent-demo-000001/start")
+            client.post("/api/consent/processing/intent-demo-000001/complete", json={
+                "derived_record_type": "instant_report", "derived_record_ref": "report-demo-0001",
+            })
+            withdrawal = client.post("/api/consent/withdrawals", json={
+                "participant_digest": "visitor-demo-0001", "purpose_code": "instant_report",
+                "reason": "体验后撤回即时结论用途", "idempotency_key": "withdrawal-demo-000001",
+            })
+            processed = client.post("/api/consent/derived/process-due", headers=headers)
+            values = [partner, notice, consent, report_gate, share_gate, register, withdrawal, processed]
+            if any(response.status_code >= 400 for response in values):
+                _print({"errors": [response.text for response in values]})
+                return 1
+            _print({
+                "notice_version": notice.json()["version"],
+                "consent_record_id": consent.json()["record_id"],
+                "instant_report_gate": report_gate.json()["allowed"],
+                "partner_sharing_gate": share_gate.json()["allowed"],
+                "withdrawal": {
+                    "affected_decisions": withdrawal.json()["affected_decisions"],
+                    "stopped_intents": withdrawal.json()["stopped_intents"],
+                    "queued_derived": withdrawal.json()["queued_derived"],
+                },
+                "derived_deleted": processed.json()["deleted"],
+            })
+        close_connection()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     command = build_parser().parse_args(argv).command
-    actions = {"init-db": init_database, "check-db": check_database, "smoke": smoke, "pilot-demo": pilot_demo}
+    actions = {"init-db": init_database, "check-db": check_database, "smoke": smoke, "pilot-demo": pilot_demo, "consent-demo": consent_demo}
     try:
         return actions[command]()
     finally:

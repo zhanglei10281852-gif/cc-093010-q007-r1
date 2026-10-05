@@ -142,10 +142,10 @@ class CatalogRepository:
             (site_id, session_reference, audience_type, contact_digest),
         ).fetchone())
 
-    def create_feedback(self, product_id: int, site_id: int, data: dict, now: str) -> dict:
+    def create_feedback(self, product_id: int, site_id: int, data: dict, now: str, *, consent_record_id: int | None = None, consent_notice_version: int | None = None) -> dict:
         cursor = self.connection.execute(
-            "INSERT INTO public_feedback(product_id,site_id,session_reference,audience_type,rating,tags_json,comment,contact_digest,consent_to_follow_up,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (product_id, site_id, data["session_reference"], data["audience_type"], data["rating"], json.dumps(sorted(set(data["tags"])), ensure_ascii=False), data["comment"], data["contact_digest"], 1 if data["consent_to_follow_up"] else 0, now),
+            "INSERT INTO public_feedback(product_id,site_id,session_reference,audience_type,rating,tags_json,comment,contact_digest,consent_to_follow_up,consent_record_id,consent_notice_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (product_id, site_id, data["session_reference"], data["audience_type"], data["rating"], json.dumps(sorted(set(data["tags"])), ensure_ascii=False), data["comment"], data["contact_digest"], 1 if data["consent_to_follow_up"] else 0, consent_record_id, consent_notice_version, now),
         )
         return dict(self.connection.execute("SELECT * FROM public_feedback WHERE id=?", (cursor.lastrowid,)).fetchone())
 

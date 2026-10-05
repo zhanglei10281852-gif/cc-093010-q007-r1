@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 
 from app.catalog.repository import CatalogRepository
+from app.consent.purposes import PURPOSE_FOLLOW_UP
+from app.consent.service import evaluate_gate
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
@@ -96,8 +98,20 @@ class CatalogService:
         duplicate = self.repository.feedback_duplicate(site["id"], data["session_reference"], data["audience_type"], data["contact_digest"])
         if duplicate:
             return duplicate
+        participant_digest = data.get("participant_digest") or ""
         with transaction(immediate=True) as connection:
-            return CatalogRepository(connection).create_feedback(product["id"], site["id"], data, to_storage(self.clock.now()))
+            consent_record_id = None
+            consent_notice_version = None
+            if data["consent_to_follow_up"]:
+                gate = evaluate_gate(connection, participant_digest, PURPOSE_FOLLOW_UP)
+                if not gate["allowed"]:
+                    raise ConflictError("后续联系用途没有有效授权：" + gate["reason"])
+                consent_record_id = gate["record_id"]
+                consent_notice_version = gate["notice_version"]
+            return CatalogRepository(connection).create_feedback(
+                product["id"], site["id"], data, to_storage(self.clock.now()),
+                consent_record_id=consent_record_id, consent_notice_version=consent_notice_version,
+            )
 
     def feedback_summary(self, product_code: str | None) -> list[dict]:
         product_id = None

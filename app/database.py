@@ -186,6 +186,8 @@ CREATE TABLE IF NOT EXISTS public_feedback (
     comment TEXT NOT NULL DEFAULT '',
     contact_digest TEXT NOT NULL DEFAULT '',
     consent_to_follow_up INTEGER NOT NULL DEFAULT 0 CHECK(consent_to_follow_up IN (0,1)),
+    consent_record_id INTEGER,
+    consent_notice_version INTEGER,
     created_at TEXT NOT NULL,
     UNIQUE(site_id, session_reference, audience_type, contact_digest)
 );
@@ -266,6 +268,152 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+CREATE TABLE IF NOT EXISTS consent_partners (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    partner_code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    partner_type TEXT NOT NULL,
+    region TEXT NOT NULL DEFAULT '',
+    retention_days INTEGER,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended','closed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS consent_notice_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    notice_code TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    content_excerpt TEXT NOT NULL DEFAULT '',
+    purposes_json TEXT NOT NULL,
+    data_categories_json TEXT NOT NULL DEFAULT '[]',
+    partners_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('draft','active','deprecated')),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(notice_code, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_consent_notice_active
+    ON consent_notice_versions(notice_code) WHERE status='active';
+CREATE TABLE IF NOT EXISTS consent_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    participant_digest TEXT NOT NULL,
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('self','guardian')),
+    guardian_relation TEXT,
+    guardian_basis TEXT,
+    guardian_digest TEXT,
+    site_code TEXT NOT NULL,
+    session_reference TEXT NOT NULL,
+    notice_id INTEGER NOT NULL REFERENCES consent_notice_versions(id),
+    notice_code TEXT NOT NULL,
+    notice_version INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_fingerprint TEXT NOT NULL,
+    validity_starts_at TEXT NOT NULL,
+    validity_expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consent_records_participant ON consent_records(participant_digest,id);
+CREATE TABLE IF NOT EXISTS consent_purpose_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_id INTEGER NOT NULL REFERENCES consent_records(id) ON DELETE CASCADE,
+    participant_digest TEXT NOT NULL,
+    purpose_code TEXT NOT NULL,
+    partner_code TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL CHECK(decision IN ('allow','deny')),
+    notice_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(record_id, purpose_code, partner_code)
+);
+CREATE INDEX IF NOT EXISTS idx_consent_decisions_flow ON consent_purpose_decisions(participant_digest,purpose_code,partner_code,id);
+CREATE TABLE IF NOT EXISTS consent_current_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    participant_digest TEXT NOT NULL,
+    purpose_code TEXT NOT NULL,
+    partner_code TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL CHECK(decision IN ('allow','deny')),
+    notice_id INTEGER NOT NULL REFERENCES consent_notice_versions(id),
+    notice_version INTEGER NOT NULL,
+    record_id INTEGER NOT NULL REFERENCES consent_records(id),
+    seq INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded','expired','withdrawn')),
+    decided_at TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_until TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(participant_digest, purpose_code, partner_code)
+);
+CREATE INDEX IF NOT EXISTS idx_consent_current_expiry ON consent_current_decisions(status,valid_until);
+CREATE TABLE IF NOT EXISTS consent_withdrawals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    participant_digest TEXT NOT NULL,
+    purpose_code TEXT,
+    partner_code TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_fingerprint TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    processed_at TEXT,
+    affected_decisions INTEGER NOT NULL DEFAULT 0,
+    stopped_intents INTEGER NOT NULL DEFAULT 0,
+    queued_derived INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_consent_withdrawals_participant ON consent_withdrawals(participant_digest,id);
+CREATE TABLE IF NOT EXISTS consent_withdrawal_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    withdrawal_id INTEGER NOT NULL REFERENCES consent_withdrawals(id) ON DELETE CASCADE,
+    record_id INTEGER NOT NULL REFERENCES consent_records(id),
+    participant_digest TEXT NOT NULL,
+    purpose_code TEXT NOT NULL,
+    partner_code TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL,
+    notice_version INTEGER NOT NULL,
+    decided_seq INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(withdrawal_id, record_id, purpose_code, partner_code)
+);
+CREATE INDEX IF NOT EXISTS idx_consent_withdrawal_trace ON consent_withdrawal_decisions(record_id,purpose_code,partner_code);
+CREATE TABLE IF NOT EXISTS consent_processing_intents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    participant_digest TEXT NOT NULL,
+    purpose_code TEXT NOT NULL,
+    partner_code TEXT NOT NULL DEFAULT '',
+    site_code TEXT NOT NULL,
+    session_reference TEXT NOT NULL,
+    record_type TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled','running','done','stopped')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_fingerprint TEXT NOT NULL DEFAULT '',
+    stopped_by_withdrawal_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(participant_digest, purpose_code, partner_code, site_code, session_reference, record_type)
+);
+CREATE INDEX IF NOT EXISTS idx_consent_intents_lookup ON consent_processing_intents(participant_digest,site_code,session_reference,status);
+CREATE TABLE IF NOT EXISTS consent_derived_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    participant_digest TEXT NOT NULL,
+    source_purpose_code TEXT NOT NULL,
+    source_partner_code TEXT NOT NULL DEFAULT '',
+    record_type TEXT NOT NULL,
+    record_ref TEXT NOT NULL,
+    notice_version INTEGER NOT NULL,
+    retention_basis TEXT NOT NULL DEFAULT '',
+    retention_until TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','retained','quarantined','delete_pending','deleted')),
+    queued_action TEXT NOT NULL DEFAULT 'none' CHECK(queued_action IN ('none','retain','quarantine','delete')),
+    action_due_at TEXT,
+    disposition_reason TEXT NOT NULL DEFAULT '',
+    withdrawal_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    processed_at TEXT,
+    UNIQUE(record_type, record_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_consent_derived_participant ON consent_derived_records(participant_digest,id);
+CREATE INDEX IF NOT EXISTS idx_consent_derived_queue ON consent_derived_records(status,action_due_at);
 '''
 
 
@@ -280,6 +428,8 @@ PERMISSIONS = [
     ("catalog.write", "维护健康创新目录", "catalog", "write"),
     ("evidence.review", "审阅产品证据", "evidence", "review"),
     ("feedback.read", "查看体验反馈", "feedback", "read"),
+    ("consent.read", "查看用途授权", "consent", "read"),
+    ("consent.admin", "管理告知版本与合作方", "consent", "admin"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
 ]
@@ -334,7 +484,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

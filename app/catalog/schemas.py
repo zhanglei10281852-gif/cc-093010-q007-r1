@@ -69,10 +69,14 @@ class FeedbackSubmit(BaseModel):
     comment: str = Field(default="", max_length=2000)
     contact_digest: str = Field(default="", max_length=128)
     consent_to_follow_up: bool = False
+    participant_digest: str = Field(default="", max_length=128)
 
     @model_validator(mode="after")
     def require_contact_for_follow_up(self) -> "FeedbackSubmit":
-        if self.consent_to_follow_up and not self.contact_digest:
-            raise ValueError("允许后续联系时必须提供联系人摘要")
+        if self.consent_to_follow_up:
+            if not self.contact_digest:
+                raise ValueError("允许后续联系时必须提供联系人摘要")
+            if not self.participant_digest:
+                raise ValueError("允许后续联系时必须提供参与者授权标识以核验用途授权")
         return self
 

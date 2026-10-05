@@ -23,11 +23,44 @@ SITE = {
 }
 
 
-def test_product_site_evidence_and_feedback_flow(client):
+def grant_follow_up_consent(client, admin: dict, participant: str) -> None:
+    notice = client.post(
+        "/api/consent/notices",
+        headers=admin["headers"],
+        json={
+            "notice_code": "expo-tongue-eeg",
+            "title": "数贸会 AI 舌诊与脑电体验告知",
+            "content_hash": "notice-content-hash-0001",
+            "purposes": ["collection", "instant_report", "product_improvement", "follow_up"],
+            "data_categories": ["舌象图像", "脑电信号"],
+            "created_by": "privacy-officer",
+        },
+    )
+    assert notice.status_code == 201, notice.text
+    consent = client.post("/api/consent/records", json={
+        "participant_digest": participant,
+        "site_code": "clinical-a",
+        "session_reference": "session-001",
+        "subject_type": "self",
+        "notice_code": "expo-tongue-eeg",
+        "decisions": [
+            {"purpose_code": "collection", "decision": "allow"},
+            {"purpose_code": "instant_report", "decision": "allow"},
+            {"purpose_code": "product_improvement", "decision": "deny"},
+            {"purpose_code": "follow_up", "decision": "allow"},
+        ],
+        "validity_days": 90,
+        "idempotency_key": "consent-session-000001",
+    })
+    assert consent.status_code == 201, consent.text
+
+
+def test_product_site_evidence_and_feedback_flow(client, admin):
     product = client.post("/api/catalog/products", json=PRODUCT)
     assert product.status_code == 201, product.text
     site = client.post("/api/catalog/sites", json=SITE)
     assert site.status_code == 201, site.text
+    grant_follow_up_consent(client, admin, "participant-a")
     evidence = client.post("/api/catalog/evidence", json={
         "product_code": "diagnostic-ai",
         "evidence_type": "性能",
@@ -52,6 +85,7 @@ def test_product_site_evidence_and_feedback_flow(client):
         "comment": "异常提示需要保留原始图像位置",
         "contact_digest": "contact-a",
         "consent_to_follow_up": True,
+        "participant_digest": "participant-a",
     })
     assert feedback.status_code == 201, feedback.text
     summary = client.get("/api/catalog/feedback/summary?product_code=diagnostic-ai")
